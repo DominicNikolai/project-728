@@ -1,0 +1,1801 @@
+<div id='xeno-lab'></div>
+
+<style is:global>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #010405;
+  }
+
+  #xeno-lab {
+    position: fixed;
+    inset: 0;
+  }
+
+  #xeno-lab canvas {
+    display: block;
+  }
+</style>
+
+<script>
+import {
+  ACESFilmicToneMapping,
+  AdditiveBlending,
+  BackSide,
+  BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
+  CanvasTexture,
+  CircleGeometry,
+  Clock,
+  Color,
+  CustomBlending,
+  CylinderGeometry,
+  DoubleSide,
+  Euler,
+  ExtrudeGeometry,
+  FogExp2,
+  Float32BufferAttribute,
+  Group,
+  HalfFloatType,
+  HemisphereLight,
+  InstancedMesh,
+  MathUtils,
+  Matrix4,
+  Mesh,
+  MeshBasicMaterial,
+  MeshStandardMaterial,
+  OneFactor,
+  OneMinusSrcAlphaFactor,
+  Path,
+  PerspectiveCamera,
+  PlaneGeometry,
+  PMREMGenerator,
+  PointLight,
+  Points,
+  Quaternion,
+  RepeatWrapping,
+  Scene,
+  ShaderChunk,
+  ShaderMaterial,
+  Shape,
+  ShapeGeometry,
+  SRGBColorSpace,
+  Sphere,
+  TorusGeometry,
+  Vector2,
+  Vector3,
+  Vector4,
+  WebGLRenderer,
+  WebGLRenderTarget
+} from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import GUI from 'lil-gui';
+
+type CreatureName = 'leviathan' | 'serpent' | 'beast' | 'jelly';
+
+interface CreatureDefinition {
+  spine: number[][];
+  limbs: number[][][];
+}
+
+interface Tank {
+  x: number;
+  z: number;
+  creature: CreatureName;
+  seed: number;
+  faulty: number;
+  yaw: number;
+}
+
+interface Greeble {
+  p: Vector3;
+  q: Quaternion;
+  s: Vector3;
+  tone?: number;
+}
+
+interface SpecimenState {
+  def: CreatureDefinition;
+  spine: Vector4[];
+  limbA: Vector4[];
+  limbB: Vector4[];
+  seed: number;
+}
+
+const container = document.getElementById('xeno-lab') as HTMLDivElement;
+
+// ============================================================================
+// Scene parameters
+// ============================================================================
+const PARAMS = {
+  camera: { fov: 64, height: 2.3, lookHeight: 2.25, autoMove: true, moveSpeed: 0.8, turnDuration: 7 },
+  animation: { timeScale: 1.0, bubbleSpeed: 1.0, specimenMotion: 3.0 },
+  geometry: { bubblesPerTank: 520, bubbleSize: 1.0 },
+  material: { liquidDensity: 1.0, specimenGlow: 1.0, glassReflection: 1.0, metalRoughness: 0.55, envIntensity: 0.6 },
+  colors: {
+    liquid: '#0b6f7c',
+    glow: '#8cf6ff',
+    tankLight: '#9ff3ff',
+    amber: '#4abef7',
+    fog: '#041013',
+    metal: '#3a4646'
+  },
+  lighting: { tankLight: 12, amberLight: 4, ambient: 0.9, exposure: 1.0, flicker: true, flickerRate: 1.0, flickerDepth: 0.85 },
+  post: { bloomStrength: 0.42, bloomRadius: 0.5, bloomThreshold: 1.0, vignette: 0.85, chromatic: 0.0012, grain: 0.045, fogDensity: 0.021, mist: 1.6 },
+  performance: { dpr: Math.min(window.devicePixelRatio || 1, 1.5), raySteps: 44, msaa: 8, smaa: true, paused: false }
+};
+
+const MAX_DPR = 2;
+
+// Guard against NaN normals in bump mapping on surfaces with degenerate UV derivatives
+// (normalize(vec3(0)) returns NaN on some GPUs, which bloom then spreads into black blocks)
+ShaderChunk.bumpmap_pars_fragment = ShaderChunk.bumpmap_pars_fragment.replace(
+  'return normalize( abs( fDet ) * surf_norm - vGrad );',
+  'vec3 bumpN = abs( fDet ) * surf_norm - vGrad; float bumpL = length( bumpN ); return bumpL > 1e-6 ? bumpN / bumpL : surf_norm;'
+).replace(
+  // Built-in bump strength is constant in screen space, so distant texels alias into
+  // shimmering lines. Fade the bump once a pixel covers more than ~1 texel.
+  'return vec2( dBx, dBy );',
+  'vec2 bumpTs = vec2( textureSize( bumpMap, 0 ) ); float bumpFootprint = max( length( dSTdx * bumpTs ), length( dSTdy * bumpTs ) ); return vec2( dBx, dBy ) / ( 1.0 + max( bumpFootprint - 1.0, 0.0 ) * 0.9 );'
+);
+
+// Corridor layout
+const CORRIDOR_FRONT = 12;
+const CORRIDOR_BACK = -28;
+const OCTAGON: [number, number][] = [
+  [-6.2, 0.0], [6.2, 0.0], [7.6, 1.4], [7.6, 6.6],
+  [6.0, 8.6], [-6.0, 8.6], [-7.6, 6.6], [-7.6, 1.4]
+];
+const RIB_Z = [4.5, -5.0, -12.0, -19.0, -26.2];
+const TANK_RADIUS = 1.1;
+const TANK_HALF_H = 2.25;
+const TANK_CENTER_Y = 1.66 + TANK_HALF_H;
+
+const TANKS: Tank[] = [
+  { x: -4.35, z: -1.5, creature: 'beast', seed: 1.3, faulty: 1.0, yaw: 0 },
+  { x: 4.35, z: -1.5, creature: 'serpent', seed: 4.1, faulty: 1.0, yaw: 0 },
+  { x: -4.35, z: -8.5, creature: 'jelly', seed: 2.7, faulty: 2.6, yaw: 0 },
+  { x: 4.35, z: -8.5, creature: 'jelly', seed: 7.9, faulty: 1.0, yaw: 0 },
+  { x: -4.35, z: -15.5, creature: 'serpent', seed: 5.5, faulty: 1.0, yaw: 0 },
+  { x: 4.35, z: -15.5, creature: 'beast', seed: 3.3, faulty: 1.8, yaw: 0 },
+  { x: 0.0, z: -23.5, creature: 'leviathan', seed: 0.6, faulty: 0.7, yaw: 0 }
+];
+const TANK_COUNT = TANKS.length;
+
+// Specimen skeletons in tank-local space: spine = [x, y, z, radius], limbs = [[start], [end]]
+const CREATURES: Record<CreatureName, CreatureDefinition> = {
+  leviathan: {
+    spine: [[0.05, -2.2, 0.0, 0.30], [0.0, -1.45, 0.1, 0.46], [-0.1, -0.55, 0.12, 0.54], [0.02, 0.3, 0.08, 0.48], [0.3, 0.95, 0.02, 0.36], [0.58, 1.3, 0.0, 0.2]],
+    limbs: [
+      [[-0.25, -0.3, 0.3, 0.11], [-0.62, -1.15, 0.42, 0.035]],
+      [[0.28, -0.25, 0.32, 0.11], [0.62, -1.05, 0.46, 0.035]],
+      [[-0.05, -1.7, -0.1, 0.18], [-0.55, -2.2, -0.25, 0.05]],
+      [[0.15, 0.45, -0.25, 0.16], [0.28, 1.25, -0.5, 0.04]]
+    ]
+  },
+  serpent: {
+    spine: [[0.3, -2.0, 0.1, 0.10], [-0.25, -1.2, 0.25, 0.19], [0.28, -0.4, -0.15, 0.25], [-0.2, 0.4, -0.25, 0.23], [0.2, 1.15, 0.15, 0.2], [-0.05, 1.7, 0.1, 0.3]],
+    limbs: [
+      [[-0.2, 0.45, -0.25, 0.08], [-0.65, 0.1, -0.35, 0.02]],
+      [[0.26, -0.35, -0.15, 0.08], [0.7, -0.7, 0.05, 0.02]],
+      [[-0.05, 1.7, 0.1, 0.1], [0.35, 2.05, 0.3, 0.03]],
+      [[-0.05, 1.7, 0.1, 0.1], [-0.4, 2.05, -0.2, 0.03]]
+    ]
+  },
+  beast: {
+    spine: [[-0.72, -0.1, 0.05, 0.07], [-0.55, -0.45, 0.0, 0.2], [-0.2, -0.62, 0.0, 0.33], [0.22, -0.52, 0.0, 0.31], [0.45, -0.15, 0.02, 0.2], [0.55, 0.3, 0.05, 0.27]],
+    limbs: [
+      [[-0.3, -0.72, 0.22, 0.13], [-0.4, -2.05, 0.32, 0.05]],
+      [[-0.3, -0.72, -0.22, 0.13], [-0.42, -2.05, -0.3, 0.05]],
+      [[0.25, -0.62, 0.22, 0.12], [0.36, -2.05, 0.35, 0.05]],
+      [[0.25, -0.62, -0.22, 0.12], [0.34, -2.05, -0.3, 0.05]]
+    ]
+  },
+  jelly: {
+    spine: [[0.0, 0.55, 0.0, 0.05], [0.0, 0.8, 0.0, 0.32], [0.0, 1.1, 0.0, 0.52], [0.0, 1.4, 0.0, 0.54], [0.0, 1.65, 0.0, 0.38], [0.0, 1.8, 0.0, 0.08]],
+    limbs: [
+      [[0.3, 0.8, 0.28, 0.06], [0.5, -1.9, 0.42, 0.012]],
+      [[-0.3, 0.8, 0.28, 0.06], [-0.45, -1.7, 0.5, 0.012]],
+      [[0.3, 0.8, -0.28, 0.06], [0.42, -1.8, -0.5, 0.012]],
+      [[-0.3, 0.8, -0.28, 0.06], [-0.5, -2.0, -0.38, 0.012]]
+    ]
+  }
+};
+
+// ============================================================================
+// Renderer, scene, camera
+// ============================================================================
+const renderer = new WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(PARAMS.performance.dpr, MAX_DPR));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = ACESFilmicToneMapping;
+renderer.toneMappingExposure = PARAMS.lighting.exposure;
+renderer.outputColorSpace = SRGBColorSpace;
+container.appendChild(renderer.domElement);
+
+const scene = new Scene();
+const fogColor = new Color(PARAMS.colors.fog);
+const background = fogColor.clone();
+scene.background = background;
+const fog = new FogExp2(fogColor.clone(), PARAMS.post.fogDensity);
+scene.fog = fog;
+
+const camera = new PerspectiveCamera(PARAMS.camera.fov, window.innerWidth / window.innerHeight, 0.1, 120);
+const cameraTarget = new Vector3();
+
+// Camera fly-through: forward to the last tank, turn around, back to the start, turn, repeat
+const CAMERA_NEAR_Z = 4.6;
+const CAMERA_FAR_Z = -16.5;
+const cameraRig = { phase: 0, progress: 0, yaw: 0, z: CAMERA_NEAR_Z, x: 0 };
+const easeInOut = (t: number): number => 0.5 - 0.5 * Math.cos(Math.PI * Math.min(Math.max(t, 0), 1));
+
+function advanceCameraRig(dt: number): void {
+  const travel = CAMERA_NEAR_Z - CAMERA_FAR_Z;
+  const r = cameraRig;
+  if (r.phase === 0 || r.phase === 2) {
+    // Progress rate is in metres per second of the average speed
+    r.progress += dt * PARAMS.camera.moveSpeed / travel;
+    const k = easeInOut(r.progress);
+    r.z = r.phase === 0 ? CAMERA_NEAR_Z - travel * k : CAMERA_FAR_Z + travel * k;
+    r.x = 0;
+    r.yaw = r.phase === 0 ? 0 : Math.PI;
+  } else {
+    r.progress += dt / PARAMS.camera.turnDuration;
+    const k = easeInOut(r.progress);
+    const base = r.phase === 1 ? 0 : Math.PI;
+    r.yaw = base + Math.PI * k;
+    // Small sideways arc while turning so the move feels like a walk, not a spin
+    r.x = Math.sin(Math.PI * k) * 0.35 * (r.phase === 1 ? 1 : -1);
+    r.z = r.phase === 1 ? CAMERA_FAR_Z : CAMERA_NEAR_Z;
+  }
+  if (r.progress >= 1) {
+    r.progress = 0;
+    r.phase = (r.phase + 1) % 4;
+    if (r.phase === 0) r.yaw = 0;
+  }
+}
+
+function updateCamera(): void {
+  if (camera.fov !== PARAMS.camera.fov) {
+    camera.fov = PARAMS.camera.fov;
+    camera.updateProjectionMatrix();
+  }
+  const r = cameraRig;
+  camera.position.set(r.x, PARAMS.camera.height, r.z);
+  // Look far ahead along the current heading; pitch follows Look Height
+  const lookDist = 28;
+  cameraTarget.set(
+    r.x - Math.sin(r.yaw) * lookDist,
+    PARAMS.camera.lookHeight,
+    r.z - Math.cos(r.yaw) * lookDist
+  );
+  camera.lookAt(cameraTarget);
+}
+updateCamera();
+
+// Shared uniforms (referenced by several materials)
+const shared = {
+  uTime: { value: 0 },
+  uFogColor: { value: fogColor.clone() },
+  uFogDensity: { value: PARAMS.post.fogDensity },
+  uPointScale: { value: 1 },
+  uLiquid: { value: new Color(PARAMS.colors.liquid) },
+  uGlow: { value: new Color(PARAMS.colors.glow) },
+  uAvgLight: { value: 1 }
+};
+
+// ============================================================================
+// Utilities
+// ============================================================================
+function mulberry32(a: number): () => number {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const GLSL_NOISE = /* glsl */`
+  float hash13(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+  }
+  float vnoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(
+      mix(mix(hash13(i), hash13(i + vec3(1,0,0)), f.x), mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+      mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x), mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y),
+      f.z);
+  }
+`;
+
+// ============================================================================
+// Procedural textures (sci-fi hull panels, floor grating)
+// ============================================================================
+function createCanvas(size: number): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  return c;
+}
+
+function createPanelTextures(size: number, seed: number) {
+  const rng = mulberry32(seed);
+  const colC = createCanvas(size), hC = createCanvas(size), rC = createCanvas(size);
+  const cc = colC.getContext('2d')!, hc = hC.getContext('2d')!, rc = rC.getContext('2d')!;
+  const gray = (v: number): string => `rgb(${v | 0},${v | 0},${v | 0})`;
+
+  cc.fillStyle = '#8c9696'; cc.fillRect(0, 0, size, size);
+  hc.fillStyle = gray(110); hc.fillRect(0, 0, size, size);
+  rc.fillStyle = gray(170); rc.fillRect(0, 0, size, size);
+
+  // Subdivide into hull panels
+  const rects: [number, number, number, number][] = [];
+  const split = (x: number, y: number, w: number, h: number, d: number): void => {
+    if (d > 4 || (d > 1 && rng() < 0.28) || w < 70 || h < 70) { rects.push([x, y, w, h]); return; }
+    const vertical = w > h ? rng() < 0.8 : rng() < 0.2;
+    if (vertical) {
+      const s = Math.round(w * (0.3 + rng() * 0.4));
+      split(x, y, s, h, d + 1); split(x + s, y, w - s, h, d + 1);
+    } else {
+      const s = Math.round(h * (0.3 + rng() * 0.4));
+      split(x, y, w, s, d + 1); split(x, y + s, w, h - s, d + 1);
+    }
+  };
+  split(0, 0, size, size, 0);
+
+  for (const [x, y, w, h] of rects) {
+    const tone = rng();
+    // Raised panel face
+    hc.fillStyle = gray(135 + tone * 40); hc.fillRect(x + 5, y + 5, w - 10, h - 10);
+    cc.fillStyle = tone > 0.5 ? `rgba(255,255,255,${(tone - 0.5) * 0.14})` : `rgba(0,10,10,${(0.5 - tone) * 0.35})`;
+    cc.fillRect(x + 3, y + 3, w - 6, h - 6);
+    rc.fillStyle = gray(120 + tone * 90); rc.fillRect(x + 3, y + 3, w - 6, h - 6);
+
+    // Seams
+    hc.strokeStyle = gray(30); hc.lineWidth = 5; hc.strokeRect(x + 2.5, y + 2.5, w - 5, h - 5);
+    cc.strokeStyle = 'rgba(0,0,0,0.75)'; cc.lineWidth = 3; cc.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+    cc.strokeStyle = 'rgba(255,255,255,0.10)'; cc.lineWidth = 1; cc.strokeRect(x + 5.5, y + 5.5, w - 11, h - 11);
+
+    const f = rng();
+    const ix = x + 16, iy = y + 16, iw = w - 32, ih = h - 32;
+    if (iw < 20 || ih < 20) continue;
+    if (f < 0.22) {
+      // Vent slats
+      const n = 4 + (rng() * 10) | 0;
+      const horizontal = iw > ih;
+      for (let i = 0; i < n; i++) {
+        if (horizontal) {
+          const sy = iy + (i + 0.5) * ih / n;
+          hc.fillStyle = gray(20); hc.fillRect(ix, sy - 2, iw, 4);
+          cc.fillStyle = 'rgba(0,0,0,0.7)'; cc.fillRect(ix, sy - 2, iw, 4);
+        } else {
+          const sx = ix + (i + 0.5) * iw / n;
+          hc.fillStyle = gray(20); hc.fillRect(sx - 2, iy, 4, ih);
+          cc.fillStyle = 'rgba(0,0,0,0.7)'; cc.fillRect(sx - 2, iy, 4, ih);
+        }
+      }
+    } else if (f < 0.45) {
+      // Recessed inset with bevel
+      hc.fillStyle = gray(95); hc.fillRect(ix, iy, iw, ih);
+      hc.strokeStyle = gray(60); hc.lineWidth = 3; hc.strokeRect(ix, iy, iw, ih);
+      cc.strokeStyle = 'rgba(0,0,0,0.55)'; cc.lineWidth = 2; cc.strokeRect(ix, iy, iw, ih);
+      rc.fillStyle = gray(90 + rng() * 60); rc.fillRect(ix, iy, iw, ih);
+    } else if (f < 0.6) {
+      // Horizontal ribs
+      const n = 2 + (rng() * 3) | 0;
+      for (let i = 0; i < n; i++) {
+        const sy = iy + (i + 0.5) * ih / n;
+        hc.fillStyle = gray(200); hc.fillRect(ix, sy - 5, iw, 10);
+        cc.fillStyle = 'rgba(255,255,255,0.07)'; cc.fillRect(ix, sy - 5, iw, 3);
+        cc.fillStyle = 'rgba(0,0,0,0.4)'; cc.fillRect(ix, sy + 4, iw, 2);
+      }
+    } else if (f < 0.7) {
+      // Small label plate
+      const lw = Math.min(iw, 60 + rng() * 60), lh = 10 + rng() * 10;
+      cc.fillStyle = 'rgba(200,215,210,0.22)'; cc.fillRect(ix, iy, lw, lh);
+      for (let k = 0; k < 6; k++) { cc.fillStyle = 'rgba(0,0,0,0.5)'; cc.fillRect(ix + 4 + k * lw / 7, iy + lh * 0.35, lw / 10, lh * 0.3); }
+    }
+    // Rivets
+    if (rng() < 0.6) {
+      const pts: [number, number][] = [[x + 10, y + 10], [x + w - 10, y + 10], [x + 10, y + h - 10], [x + w - 10, y + h - 10]];
+      for (const [px, py] of pts) {
+        hc.fillStyle = gray(230); hc.beginPath(); hc.arc(px, py, 3, 0, Math.PI * 2); hc.fill();
+        cc.fillStyle = 'rgba(255,255,255,0.18)'; cc.beginPath(); cc.arc(px, py, 2.5, 0, Math.PI * 2); cc.fill();
+      }
+    }
+    // Grime streaks
+    if (rng() < 0.5) {
+      const g = cc.createLinearGradient(0, y, 0, y + h);
+      g.addColorStop(0, 'rgba(0,8,8,0.35)'); g.addColorStop(1, 'rgba(0,8,8,0)');
+      cc.fillStyle = g;
+      for (let s = 0; s < 6; s++) cc.fillRect(x + rng() * w, y, 2 + rng() * 6, h * (0.3 + rng() * 0.7));
+    }
+  }
+
+  // Fine grime noise
+  for (let i = 0; i < 14000; i++) {
+    const px = rng() * size, py = rng() * size, r = 0.5 + rng() * 2.2;
+    const dark = rng() < 0.7;
+    cc.fillStyle = dark ? `rgba(0,0,0,${rng() * 0.12})` : `rgba(255,255,255,${rng() * 0.05})`;
+    cc.fillRect(px, py, r, r);
+    rc.fillStyle = dark ? `rgba(255,255,255,${rng() * 0.1})` : `rgba(0,0,0,${rng() * 0.15})`;
+    rc.fillRect(px, py, r * 2, r * 2);
+  }
+
+  const maxAniso = renderer.capabilities.getMaxAnisotropy();
+  const make = (canvas: HTMLCanvasElement, srgb: boolean): CanvasTexture => {
+    const t = new CanvasTexture(canvas);
+    t.wrapS = t.wrapT = RepeatWrapping;
+    t.anisotropy = Math.min(16, maxAniso);
+    if (srgb) t.colorSpace = SRGBColorSpace;
+    return t;
+  };
+  return { map: make(colC, true), bump: make(hC, false), rough: make(rC, false) };
+}
+
+function createGratingTextures(size: number) {
+  const colC = createCanvas(size), hC = createCanvas(size);
+  const cc = colC.getContext('2d')!, hc = hC.getContext('2d')!;
+  cc.fillStyle = '#050707'; cc.fillRect(0, 0, size, size);
+  hc.fillStyle = '#000'; hc.fillRect(0, 0, size, size);
+  // One tile = full walkway width x 1.8 m: 8 x 8 cells (~34 x 22 cm)
+  const rows = 8, cols = 8;
+  const rowBar = size * 0.03, colBar = size * 0.024;
+  for (let r = 0; r <= rows; r++) {
+    const y = r * size / rows;
+    cc.fillStyle = '#7d8a8a'; cc.fillRect(0, y - rowBar / 2, size, rowBar);
+    cc.fillStyle = '#b8c4c4'; cc.fillRect(0, y - rowBar / 2, size, rowBar * 0.22);
+    cc.fillStyle = 'rgba(0,0,0,0.55)'; cc.fillRect(0, y + rowBar / 2, size, rowBar * 0.35);
+    hc.fillStyle = '#fff'; hc.fillRect(0, y - rowBar / 2, size, rowBar);
+  }
+  for (let c = 0; c <= cols; c++) {
+    const x = c * size / cols;
+    cc.fillStyle = '#6f7c7c'; cc.fillRect(x - colBar / 2, 0, colBar, size);
+    cc.fillStyle = '#a9b6b6'; cc.fillRect(x - colBar / 2, 0, colBar * 0.22, size);
+    hc.fillStyle = '#e8e8e8'; hc.fillRect(x - colBar / 2, 0, colBar, size);
+  }
+  // Bolted cross points
+  for (let r = 0; r <= rows; r++) for (let c = 0; c <= cols; c++) {
+    cc.fillStyle = '#95a2a2'; cc.fillRect(c * size / cols - colBar * 0.7, r * size / rows - rowBar * 0.7, colBar * 1.4, rowBar * 1.4);
+  }
+  const maxAniso = renderer.capabilities.getMaxAnisotropy();
+  const make = (canvas: HTMLCanvasElement, srgb: boolean): CanvasTexture => {
+    const t = new CanvasTexture(canvas);
+    t.wrapS = t.wrapT = RepeatWrapping;
+    t.anisotropy = Math.min(16, maxAniso);
+    if (srgb) t.colorSpace = SRGBColorSpace;
+    return t;
+  };
+  return { map: make(colC, true), bump: make(hC, false) };
+}
+
+// ============================================================================
+// Environment map (dim teal lab reflections)
+// ============================================================================
+function buildEnvironment() {
+  const envScene = new Scene();
+  envScene.background = new Color(0x010304);
+  const geo = new BoxGeometry(1, 1, 1);
+  const mats: MeshBasicMaterial[] = [];
+  const add = (hex: string, k: number, p: number[], s: number[]): void => {
+    const m = new MeshBasicMaterial({ color: new Color(hex).multiplyScalar(k), side: DoubleSide });
+    mats.push(m);
+    const mesh = new Mesh(geo, m);
+    mesh.position.set(p[0], p[1], p[2]); mesh.scale.set(s[0], s[1], s[2]);
+    envScene.add(mesh);
+  };
+  add('#0f2a2e', 1.0, [0, -4, 0], [30, 0.1, 30]);
+  add('#7ff0ff', 3.0, [-5, 0.5, -2], [0.2, 4, 1.4]);
+  add('#7ff0ff', 3.0, [5, 0.5, -2], [0.2, 4, 1.4]);
+  add('#7ff0ff', 2.0, [-5, 0.5, -8], [0.2, 4, 1.4]);
+  add('#7ff0ff', 2.0, [5, 0.5, -8], [0.2, 4, 1.4]);
+  add('#bff8ff', 5.0, [0, 1, -10], [1.5, 3, 0.2]);
+  add('#9ff3ff', 2.0, [0, 5, 0], [2, 0.1, 12]);
+  add('#ff8a2a', 4.0, [-4.5, -3, 3], [1.2, 0.1, 0.1]);
+  add('#ff8a2a', 4.0, [4.5, -3, 3], [1.2, 0.1, 0.1]);
+  add('#ff8a2a', 3.0, [0, -2.5, -9], [2.5, 0.1, 0.1]);
+  const pmrem = new PMREMGenerator(renderer);
+  const rt = pmrem.fromScene(envScene, 0.035);
+  pmrem.dispose();
+  geo.dispose();
+  mats.forEach((m) => m.dispose());
+  return rt.texture;
+}
+scene.environment = buildEnvironment();
+scene.environmentIntensity = PARAMS.material.envIntensity;
+
+// ============================================================================
+// Materials
+// ============================================================================
+const panelTex = createPanelTextures(1024, 1337);
+const gratingTex = createGratingTextures(512);
+const metalColor = new Color(PARAMS.colors.metal);
+
+const wallMaterial = new MeshStandardMaterial({
+  color: metalColor, map: panelTex.map, bumpMap: panelTex.bump, bumpScale: 2.2,
+  roughnessMap: panelTex.rough, roughness: PARAMS.material.metalRoughness, metalness: 0.78
+});
+const hardwareMaterial = new MeshStandardMaterial({
+  color: metalColor, map: panelTex.map, bumpMap: panelTex.bump, bumpScale: 1.6,
+  roughnessMap: panelTex.rough, roughness: PARAMS.material.metalRoughness * 0.85, metalness: 0.85
+});
+const darkMetalMaterial = new MeshStandardMaterial({
+  color: metalColor.clone().multiplyScalar(0.55), roughness: PARAMS.material.metalRoughness * 0.7, metalness: 0.9,
+  roughnessMap: panelTex.rough, bumpMap: panelTex.bump, bumpScale: 0.8
+});
+const floorMaterial = new MeshStandardMaterial({
+  color: metalColor.clone().multiplyScalar(0.85), map: panelTex.map, bumpMap: panelTex.bump, bumpScale: 1.4,
+  roughnessMap: panelTex.rough, roughness: PARAMS.material.metalRoughness * 0.6, metalness: 0.8
+});
+const gratingMaterial = new MeshStandardMaterial({
+  color: metalColor.clone().multiplyScalar(1.2), map: gratingTex.map, bumpMap: gratingTex.bump, bumpScale: 3,
+  roughness: 0.45, metalness: 0.85
+});
+const metalMaterials: Array<[MeshStandardMaterial, number, number | null]> = [
+  [wallMaterial, 1.0, 1.0], [hardwareMaterial, 1.0, 0.85], [darkMetalMaterial, 0.55, 0.7],
+  [floorMaterial, 0.85, 0.6], [gratingMaterial, 1.2, null]
+];
+
+const amberColor = new Color(PARAMS.colors.amber);
+const amberEmissive = new MeshBasicMaterial({ color: amberColor.clone().multiplyScalar(4.0) });
+const cyanEmissive = new MeshBasicMaterial({ color: 0xffffff });
+
+// ============================================================================
+// Corridor shell
+// ============================================================================
+const tmpMatrix = new Matrix4();
+const tmpQuat = new Quaternion();
+const tmpEuler = new Euler();
+const tmpPos = new Vector3();
+const tmpScale = new Vector3();
+const tmpColor = new Color();
+const tmpVecA = new Vector3();
+const tmpVecB = new Vector3();
+const tmpVecC = new Vector3();
+
+function octagonSide(i: number) {
+  const a = OCTAGON[i], b = OCTAGON[(i + 1) % 8];
+  const ex = b[0] - a[0], ey = b[1] - a[1];
+  const len = Math.hypot(ex, ey);
+  return { a, b, len, dir: [ex / len, ey / len] as [number, number], normal: [-ey / len, ex / len] as [number, number] };
+}
+
+function buildShell() {
+  const pos: number[] = [], nrm: number[] = [], uv: number[] = [], idx: number[] = [];
+  let perimeter = 0;
+  const texScale = 1 / 3.2;
+  for (let i = 1; i < 8; i++) {
+    const s = octagonSide(i);
+    const base = pos.length / 3;
+    const v0 = perimeter * texScale, v1 = (perimeter + s.len) * texScale;
+    const u0 = -CORRIDOR_FRONT * texScale, u1 = -CORRIDOR_BACK * texScale;
+    pos.push(s.a[0], s.a[1], CORRIDOR_FRONT, s.b[0], s.b[1], CORRIDOR_FRONT, s.b[0], s.b[1], CORRIDOR_BACK, s.a[0], s.a[1], CORRIDOR_BACK);
+    for (let k = 0; k < 4; k++) nrm.push(s.normal[0], s.normal[1], 0);
+    uv.push(u0, v0, u0, v1, u1, v1, u1, v0);
+    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    perimeter += s.len;
+  }
+  const g = new BufferGeometry();
+  g.setAttribute('position', new Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new Float32BufferAttribute(nrm, 3));
+  g.setAttribute('uv', new Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return new Mesh(g, wallMaterial);
+}
+scene.add(buildShell());
+
+// Floor: side panels + central grating walkway
+function buildFloor() {
+  const group = new Group();
+  const len = CORRIDOR_FRONT - CORRIDOR_BACK;
+  const midZ = (CORRIDOR_FRONT + CORRIDOR_BACK) / 2;
+  const sideW = 6.2 - 1.35;
+  for (const sign of [-1, 1]) {
+    const g = new PlaneGeometry(sideW, len);
+    const uvAttr = g.attributes.uv;
+    for (let i = 0; i < uvAttr.count; i++) uvAttr.setXY(i, uvAttr.getX(i) * sideW / 2.6, uvAttr.getY(i) * len / 2.6);
+    g.rotateX(-Math.PI / 2);
+    const m = new Mesh(g, floorMaterial);
+    m.position.set(sign * (1.35 + sideW / 2), 0, midZ);
+    group.add(m);
+  }
+  const gg = new PlaneGeometry(2.7, len);
+  const guv = gg.attributes.uv;
+  for (let i = 0; i < guv.count; i++) guv.setXY(i, guv.getX(i) * 1.0, guv.getY(i) * len / 1.8);
+  gg.rotateX(-Math.PI / 2);
+  const grating = new Mesh(gg, gratingMaterial);
+  grating.position.set(0, 0.012, midZ);
+  group.add(grating);
+  return group;
+}
+scene.add(buildFloor());
+
+// Octagonal structural ribs
+function buildRibs(): void {
+  const outer = new Shape();
+  const outerPts: [number, number][] = [[-6.2, -0.3], [6.2, -0.3], [7.62, 1.4], [7.62, 6.6], [6.0, 8.62], [-6.0, 8.62], [-7.62, 6.6], [-7.62, 1.4]];
+  outerPts.forEach(([x, y], i) => (i === 0 ? outer.moveTo(x, y) : outer.lineTo(x, y)));
+  const innerPts: [number, number][] = [[-5.55, -0.2], [5.55, -0.2], [6.95, 1.65], [6.95, 6.35], [5.55, 7.95], [-5.55, 7.95], [-6.95, 6.35], [-6.95, 1.65]];
+  const hole = new Path();
+  [...innerPts].reverse().forEach(([x, y], i) => (i === 0 ? hole.moveTo(x, y) : hole.lineTo(x, y)));
+  outer.holes.push(hole);
+  const ribGeo = new ExtrudeGeometry(outer, { depth: 0.7, bevelEnabled: true, bevelThickness: 0.05, bevelSize: 0.05, bevelSegments: 1, curveSegments: 1 });
+  ribGeo.translate(0, 0, -0.35);
+  const uvA = ribGeo.attributes.uv;
+  for (let i = 0; i < uvA.count; i++) uvA.setXY(i, uvA.getX(i) * 0.3, uvA.getY(i) * 0.3);
+
+  // Inner trim ring (layered frame detail)
+  const trim = new Shape();
+  innerPts.forEach(([x, y], i) => {
+    const sx = x * 1.005, sy = y < 0 ? -0.2 : y;
+    i === 0 ? trim.moveTo(sx, sy) : trim.lineTo(sx, sy);
+  });
+  const trimInner: [number, number][] = [[-5.3, -0.15], [5.3, -0.15], [6.72, 1.75], [6.72, 6.25], [5.4, 7.72], [-5.4, 7.72], [-6.72, 6.25], [-6.72, 1.75]];
+  const trimHole = new Path();
+  [...trimInner].reverse().forEach(([x, y], i) => (i === 0 ? trimHole.moveTo(x, y) : trimHole.lineTo(x, y)));
+  trim.holes.push(trimHole);
+  const trimGeo = new ExtrudeGeometry(trim, { depth: 0.22, bevelEnabled: true, bevelThickness: 0.03, bevelSize: 0.03, bevelSegments: 1, curveSegments: 1 });
+  trimGeo.translate(0, 0, -0.11);
+  const uvB = trimGeo.attributes.uv;
+  for (let i = 0; i < uvB.count; i++) uvB.setXY(i, uvB.getX(i) * 0.3, uvB.getY(i) * 0.3);
+
+  const ribs = new InstancedMesh(ribGeo, hardwareMaterial, RIB_Z.length);
+  const trims = new InstancedMesh(trimGeo, darkMetalMaterial, RIB_Z.length * 2);
+  RIB_Z.forEach((z, i) => {
+    tmpMatrix.makeTranslation(0, 0, z); ribs.setMatrixAt(i, tmpMatrix);
+    tmpMatrix.makeTranslation(0, 0, z + 0.48); trims.setMatrixAt(i * 2, tmpMatrix);
+    tmpMatrix.makeTranslation(0, 0, z - 0.48); trims.setMatrixAt(i * 2 + 1, tmpMatrix);
+  });
+  scene.add(ribs, trims);
+}
+buildRibs();
+
+// ============================================================================
+// Greeble details: instanced boxes and cylinders
+// ============================================================================
+const boxDetails: Greeble[] = [];
+const cylDetails: Greeble[] = [];
+const amberDetails: Greeble[] = [];
+const rngDetail = mulberry32(99);
+
+function sideMatrix(sideIndex: number, s: number, z: number, w: number, t: number, l: number, lift = 0): Greeble {
+  const side = octagonSide(sideIndex);
+  const cx = side.a[0] + side.dir[0] * s + side.normal[0] * (t / 2 + lift);
+  const cy = side.a[1] + side.dir[1] * s + side.normal[1] * (t / 2 + lift);
+  tmpVecA.set(side.dir[0], side.dir[1], 0);
+  tmpVecB.set(side.normal[0], side.normal[1], 0);
+  tmpVecC.set(0, 0, 1);
+  const m = new Matrix4().makeBasis(tmpVecA, tmpVecB, tmpVecC);
+  const q = new Quaternion().setFromRotationMatrix(m);
+  return { p: new Vector3(cx, cy, z), q, s: new Vector3(w, t, l) };
+}
+
+function addWallGreebles(): void {
+  for (let side = 1; side < 8; side++) {
+    const info = octagonSide(side);
+    for (let z = CORRIDOR_FRONT; z > CORRIDOR_BACK;) {
+      const l = 0.5 + rngDetail() * 2.2;
+      const nPanels = 1 + (rngDetail() * 3) | 0;
+      for (let k = 0; k < nPanels; k++) {
+        const w = info.len * (0.12 + rngDetail() * 0.4);
+        const s = w / 2 + rngDetail() * (info.len - w);
+        const t = 0.04 + rngDetail() * 0.16;
+        const d = sideMatrix(side, s, z - l / 2, w, t, l * (0.8 + rngDetail() * 0.2));
+        d.tone = 0.6 + rngDetail() * 0.6;
+        boxDetails.push(d);
+      }
+      z -= l + rngDetail() * 0.4;
+    }
+    // Long pipes along the corridor
+    const pipeCount = side === 4 ? 4 : 2;
+    for (let k = 0; k < pipeCount; k++) {
+      const r = 0.06 + rngDetail() * 0.12;
+      const s = info.len * (0.15 + 0.7 * (k + rngDetail() * 0.5) / pipeCount);
+      const d = sideMatrix(side, s, (CORRIDOR_FRONT + CORRIDOR_BACK) / 2, 1, 1, 1, r + 0.12);
+      d.q = new Quaternion().setFromEuler(tmpEuler.set(Math.PI / 2, 0, 0));
+      d.s = new Vector3(r, CORRIDOR_FRONT - CORRIDOR_BACK, r);
+      d.tone = 0.5 + rngDetail() * 0.4;
+      cylDetails.push(d);
+      // Pipe clamps
+      for (let z = CORRIDOR_FRONT - 1; z > CORRIDOR_BACK; z -= 2.2) {
+        const c = sideMatrix(side, s, z, r * 2 + 0.12, r * 2 + 0.16, 0.12, 0.02);
+        c.tone = 0.7;
+        boxDetails.push(c);
+      }
+    }
+  }
+}
+addWallGreebles();
+
+function addCeilingMachinery(): void {
+  const q0 = new Quaternion();
+  const qZ = new Quaternion().setFromEuler(new Euler(Math.PI / 2, 0, 0));
+  const qX = new Quaternion().setFromEuler(new Euler(0, 0, Math.PI / 2));
+  // Central spine blocks
+  for (let z = CORRIDOR_FRONT - 1; z > -21; z -= 2.6 + rngDetail() * 1.2) {
+    const w = 1.6 + rngDetail() * 1.4, h = 0.6 + rngDetail() * 0.9, l = 1.2 + rngDetail() * 1.4;
+    boxDetails.push({ p: new Vector3((rngDetail() - 0.5) * 0.6, 8.6 - h / 2, z), q: q0, s: new Vector3(w, h, l), tone: 0.7 + rngDetail() * 0.4 });
+    boxDetails.push({ p: new Vector3(0, 8.6 - h - 0.12, z), q: q0, s: new Vector3(w * 0.7, 0.24, l * 0.8), tone: 0.5 });
+    if (rngDetail() < 0.7) {
+      const r = 0.25 + rngDetail() * 0.25;
+      cylDetails.push({ p: new Vector3(0, 8.6 - h - 0.3 - r, z - l * 0.2), q: qX, s: new Vector3(r, w * 1.1, r), tone: 0.6 });
+    }
+    // Side canisters
+    for (const sx of [-1, 1]) {
+      if (rngDetail() < 0.6) {
+        const r = 0.3 + rngDetail() * 0.25;
+        cylDetails.push({ p: new Vector3(sx * (2.2 + rngDetail()), 8.6 - r - 0.05, z), q: qZ, s: new Vector3(r, 1 + rngDetail() * 1.5, r), tone: 0.75 });
+      }
+    }
+  }
+  // Hub above the central tank
+  const hz = TANKS[6].z;
+  const hub: [number, number, number][] = [[1.9, 0.5, 8.3], [1.5, 0.35, 7.9], [1.75, 0.12, 7.66], [1.2, 0.3, 7.48], [0.9, 0.5, 7.12]];
+  hub.forEach(([r, h, y]) => cylDetails.push({ p: new Vector3(0, y, hz), q: q0, s: new Vector3(r, h, r), tone: 0.8 }));
+  // Walkway rails
+  for (const sx of [-1.38, 1.38]) {
+    boxDetails.push({ p: new Vector3(sx, 0.05, (CORRIDOR_FRONT + CORRIDOR_BACK) / 2), q: q0, s: new Vector3(0.12, 0.1, CORRIDOR_FRONT - CORRIDOR_BACK), tone: 0.9 });
+  }
+  // Floor-level amber markers and wall base lights
+  for (let z = CORRIDOR_FRONT - 1.5; z > CORRIDOR_BACK + 1; z -= 3.0) {
+    for (const sx of [-1.75, 1.75]) amberDetails.push({ p: new Vector3(sx, 0.02, z), q: q0, s: new Vector3(0.06, 0.03, 0.55) });
+  }
+  RIB_Z.forEach((z) => {
+    for (const sideIdx of [1, 7]) {
+      const d = sideMatrix(sideIdx, sideIdx === 1 ? 0.55 : octagonSide(7).len - 0.55, z + 0.45, 0.6, 0.05, 0.05, 0.08);
+      amberDetails.push(d);
+      const d2 = sideMatrix(sideIdx, sideIdx === 1 ? 0.8 : octagonSide(7).len - 0.8, z + 0.45, 0.35, 0.05, 0.05, 0.08);
+      amberDetails.push(d2);
+    }
+  });
+}
+addCeilingMachinery();
+
+// ============================================================================
+// End walls with round bulkhead doors (back and front of the corridor)
+// ============================================================================
+const backWallExtraMaterials: MeshStandardMaterial[] = [];
+function buildBulkheadWall() {
+  // Built facing +z at local z = 0; placed and rotated for each corridor end
+  const group = new Group();
+  const shape = new Shape();
+  OCTAGON.forEach(([x, y], i) => (i === 0 ? shape.moveTo(x, y) : shape.lineTo(x, y)));
+  const doorR = 3.7, doorY = 4.1;
+  const hole = new Path();
+  hole.absarc(0, doorY, doorR, 0, Math.PI * 2, true);
+  shape.holes.push(hole);
+  const wallGeo = new ShapeGeometry(shape, 48);
+  const uvA = wallGeo.attributes.uv;
+  for (let i = 0; i < uvA.count; i++) uvA.setXY(i, uvA.getX(i) / 3.2, uvA.getY(i) / 3.2);
+  group.add(new Mesh(wallGeo, wallMaterial));
+
+  const tunnelGeo = new CylinderGeometry(doorR, doorR, 2.4, 48, 1, true);
+  tunnelGeo.rotateX(Math.PI / 2);
+  const tunnelMat = new MeshStandardMaterial({ color: metalColor.clone().multiplyScalar(0.5), roughness: 0.5, metalness: 0.85, side: BackSide });
+  backWallExtraMaterials.push(tunnelMat);
+  const tunnel = new Mesh(tunnelGeo, tunnelMat);
+  tunnel.position.set(0, doorY, -1.2);
+  group.add(tunnel);
+
+  const discGeo = new CircleGeometry(doorR, 48);
+  const uvD = discGeo.attributes.uv;
+  for (let i = 0; i < uvD.count; i++) uvD.setXY(i, uvD.getX(i) * 2.2, uvD.getY(i) * 2.2);
+  const disc = new Mesh(discGeo, hardwareMaterial);
+  disc.position.set(0, doorY, -2.4);
+  group.add(disc);
+
+  // Concentric rings
+  const ring1 = new Mesh(new TorusGeometry(doorR, 0.26, 12, 72), hardwareMaterial);
+  ring1.position.set(0, doorY, 0.05);
+  const ring2 = new Mesh(new TorusGeometry(doorR - 0.55, 0.12, 10, 72), darkMetalMaterial);
+  ring2.position.set(0, doorY, -2.3);
+  const ring3 = new Mesh(new TorusGeometry(1.2, 0.18, 10, 48), hardwareMaterial);
+  ring3.position.set(0, doorY, -2.3);
+  group.add(ring1, ring2, ring3);
+
+  // Amber arcs on the bulkhead frame
+  const arcGeo = new TorusGeometry(doorR - 0.02, 0.035, 6, 32, 0.85);
+  for (const rot of [Math.PI - 0.42, -0.42]) {
+    const arc = new Mesh(arcGeo, amberEmissive);
+    arc.position.set(0, doorY, 0.32);
+    arc.rotation.z = rot;
+    group.add(arc);
+  }
+  // Radial door segments
+  const segments = new InstancedMesh(new BoxGeometry(1, 1, 1), hardwareMaterial, 12);
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    tmpPos.set(-Math.cos(a + Math.PI / 2) * 2.4, doorY + Math.sin(a + Math.PI / 2) * 2.4, -2.32);
+    tmpQuat.setFromEuler(tmpEuler.set(0, 0, a));
+    tmpScale.set(0.14, 2.0, 0.1);
+    tmpMatrix.compose(tmpPos, tmpQuat, tmpScale);
+    segments.setMatrixAt(i, tmpMatrix);
+    segments.setColorAt(i, tmpColor.setScalar(0.6));
+  }
+  group.add(segments);
+  return group;
+}
+const backBulkhead = buildBulkheadWall();
+backBulkhead.position.z = CORRIDOR_BACK;
+const frontBulkhead = backBulkhead.clone();
+frontBulkhead.position.z = CORRIDOR_FRONT;
+frontBulkhead.rotation.y = Math.PI;
+scene.add(backBulkhead, frontBulkhead);
+
+// Build greeble instanced meshes
+function buildInstanced(geo: BufferGeometry, list: Greeble[], material: MeshStandardMaterial | MeshBasicMaterial, withColor: boolean): InstancedMesh {
+  const mesh = new InstancedMesh(geo, material, list.length);
+  list.forEach((d, i) => {
+    tmpMatrix.compose(d.p, d.q, d.s);
+    mesh.setMatrixAt(i, tmpMatrix);
+    if (withColor) mesh.setColorAt(i, tmpColor.setScalar(d.tone ?? 0));
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  scene.add(mesh);
+  return mesh;
+}
+const unitBox = new BoxGeometry(1, 1, 1);
+const unitCyl = new CylinderGeometry(1, 1, 1, 20, 1);
+buildInstanced(unitBox, boxDetails, hardwareMaterial, true);
+buildInstanced(unitCyl, cylDetails, darkMetalMaterial, true);
+buildInstanced(unitBox, amberDetails, amberEmissive, false);
+
+// ============================================================================
+// Specimen tank model (merged + instanced)
+// ============================================================================
+const _pm = new Matrix4();
+const _pe = new Euler();
+function part(list: BufferGeometry[], geo: BufferGeometry, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0): void {
+  const g = geo.index ? geo.toNonIndexed() : geo;
+  if (g !== geo) geo.dispose();
+  _pm.makeRotationFromEuler(_pe.set(rx, ry, rz));
+  _pm.setPosition(x, y, z);
+  g.applyMatrix4(_pm);
+  list.push(g);
+}
+function scaleUV(geo: BufferGeometry, k: number): BufferGeometry {
+  const a = geo.attributes.uv;
+  for (let i = 0; i < a.count; i++) a.setXY(i, a.getX(i) * k, a.getY(i) * k);
+  return geo;
+}
+
+function buildTankGeometries() {
+  const metal: BufferGeometry[] = [], cyan: BufferGeometry[] = [], amber: BufferGeometry[] = [];
+  const oct = Math.PI / 8;
+  const top = TANK_CENTER_Y + TANK_HALF_H;
+  const bottom = TANK_CENTER_Y - TANK_HALF_H;
+
+  // Base
+  part(metal, scaleUV(new CylinderGeometry(1.62, 1.7, 0.3, 8, 1, false, oct), 2), 0, 0.15);
+  part(metal, scaleUV(new CylinderGeometry(1.48, 1.55, 0.55, 8, 1, false, oct), 2), 0, 0.57);
+  part(metal, scaleUV(new CylinderGeometry(1.34, 1.44, 0.55, 8, 1, false, oct), 2), 0, 1.12);
+  part(metal, new TorusGeometry(1.3, 0.05, 6, 32), 0, 0.86, 0, Math.PI / 2);
+  // Cradle arms
+  for (const sx of [-1, 1]) {
+    part(metal, new BoxGeometry(0.42, 1.9, 1.55), sx * 1.32, 1.25, 0);
+    part(metal, new BoxGeometry(0.36, 0.7, 1.35), sx * 1.18, 2.3, 0, 0, 0, sx * 0.35);
+    part(metal, new BoxGeometry(0.1, 1.5, 1.62), sx * 1.56, 1.2, 0);
+    part(metal, new TorusGeometry(0.34, 0.05, 6, 16, Math.PI), sx * 1.58, 0.7, 0.35, 0, sx * Math.PI / 2, 0);
+    part(metal, new TorusGeometry(0.24, 0.04, 6, 16, Math.PI), sx * 1.58, 0.75, -0.35, 0, sx * Math.PI / 2, 0);
+  }
+  // Front mechanical discs
+  for (const sx of [-0.52, 0.52]) {
+    part(metal, new CylinderGeometry(0.3, 0.3, 0.3, 24), sx, 0.5, 1.42, Math.PI / 2);
+    part(metal, new CylinderGeometry(0.17, 0.17, 0.42, 16), sx, 0.5, 1.46, Math.PI / 2);
+    part(metal, new TorusGeometry(0.3, 0.035, 6, 24), sx, 0.5, 1.58);
+  }
+  part(metal, new BoxGeometry(0.5, 0.35, 0.3), 0, 0.5, 1.45);
+  // Glass collars
+  part(metal, new CylinderGeometry(1.26, 1.3, 0.26, 32), 0, bottom - 0.1);
+  part(metal, new TorusGeometry(1.2, 0.055, 8, 48), 0, bottom + 0.02, 0, Math.PI / 2);
+  part(metal, new CylinderGeometry(1.3, 1.26, 0.3, 32), 0, top + 0.12);
+  part(metal, new TorusGeometry(1.2, 0.055, 8, 48), 0, top - 0.02, 0, Math.PI / 2);
+  // Top cap
+  part(metal, scaleUV(new CylinderGeometry(1.42, 1.52, 0.55, 8, 1, false, oct), 2), 0, top + 0.54);
+  part(metal, scaleUV(new CylinderGeometry(1.2, 1.4, 0.35, 8, 1, false, oct), 2), 0, top + 0.98);
+  part(metal, new BoxGeometry(2.2, 0.28, 0.6), 0, top + 0.65, -0.9);
+  // Pipes to ceiling
+  part(metal, new CylinderGeometry(0.22, 0.22, 1.8, 16), 0, top + 1.9, -0.4);
+  part(metal, new CylinderGeometry(0.13, 0.13, 1.8, 12), -0.6, top + 1.9, 0.1);
+  part(metal, new CylinderGeometry(0.13, 0.13, 1.8, 12), 0.6, top + 1.9, 0.1);
+  part(metal, new CylinderGeometry(0.3, 0.3, 0.14, 16), 0, top + 1.4, -0.4);
+  // Vertical struts around glass
+  const strutH = top - bottom + 0.2;
+  for (const a of [Math.PI * 0.75, -Math.PI * 0.75]) {
+    part(metal, new BoxGeometry(0.13, strutH, 0.2), Math.sin(a) * 1.2, TANK_CENTER_Y, Math.cos(a) * 1.2, 0, a, 0);
+  }
+  for (const a of [Math.PI / 2, -Math.PI / 2]) {
+    part(metal, new BoxGeometry(0.2, strutH, 0.34), Math.sin(a) * 1.22, TANK_CENTER_Y, Math.cos(a) * 1.22, 0, a, 0);
+  }
+  // Back spine with cable bundle
+  part(metal, new BoxGeometry(0.7, strutH + 0.6, 0.35), 0, TANK_CENTER_Y, -1.3);
+  for (const sx of [-0.2, 0, 0.2]) part(metal, new CylinderGeometry(0.06, 0.06, strutH, 8), sx, TANK_CENTER_Y, -1.52);
+
+  // Cyan emissive: top light plate, rings, cap bars
+  part(cyan, new CylinderGeometry(0.72, 0.72, 0.04, 32), 0, top - 0.06);
+  part(cyan, new TorusGeometry(1.305, 0.018, 6, 64), 0, top + 0.28, 0, Math.PI / 2);
+  part(metal, new TorusGeometry(1.31, 0.03, 6, 48), 0, bottom - 0.26, 0, Math.PI / 2);
+  part(cyan, new BoxGeometry(0.9, 0.045, 0.02), 0, top + 0.62, 1.4);
+  part(cyan, new BoxGeometry(0.6, 0.045, 0.02), 0, top + 0.72, 1.39);
+  // Amber indicators
+  part(amber, new BoxGeometry(0.28, 0.05, 0.02), -0.95, 0.66, 1.39);
+  part(amber, new BoxGeometry(0.28, 0.05, 0.02), 0.95, 0.66, 1.39);
+  part(amber, new BoxGeometry(0.06, 0.06, 0.02), 0, 1.2, 1.29);
+
+  const m = mergeGeometries(metal)!;
+  const c = mergeGeometries(cyan)!;
+  const a = mergeGeometries(amber)!;
+  metal.forEach((g) => g.dispose()); cyan.forEach((g) => g.dispose()); amber.forEach((g) => g.dispose());
+  return { metal: m, cyan: c, amber: a };
+}
+
+const tankGeo = buildTankGeometries();
+const tankMetal = new InstancedMesh(tankGeo.metal, hardwareMaterial, TANK_COUNT);
+const tankCyan = new InstancedMesh(tankGeo.cyan, cyanEmissive, TANK_COUNT);
+const tankAmber = new InstancedMesh(tankGeo.amber, amberEmissive, TANK_COUNT);
+// Each tank faces the default viewpoint so frame struts sit on the silhouette
+TANKS.forEach((t) => { t.yaw = Math.atan2(-t.x, 4.6 - t.z); });
+TANKS.forEach((t, i) => {
+  tmpPos.set(t.x, 0, t.z);
+  tmpQuat.setFromEuler(tmpEuler.set(0, t.yaw, 0));
+  tmpScale.set(1, 1, 1);
+  tmpMatrix.compose(tmpPos, tmpQuat, tmpScale);
+  tankMetal.setMatrixAt(i, tmpMatrix);
+  tankCyan.setMatrixAt(i, tmpMatrix);
+  tankAmber.setMatrixAt(i, tmpMatrix);
+  tankCyan.setColorAt(i, tmpColor.set(1, 1, 1));
+});
+scene.add(tankMetal, tankCyan, tankAmber);
+
+// ============================================================================
+// Raymarched liquid volume with specimen
+// ============================================================================
+const liquidVertex = /* glsl */`
+  varying vec3 vWorld;
+  void main() {
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vWorld = wp.xyz;
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+
+const liquidFragment = /* glsl */`
+  uniform float uTime;
+  uniform vec3 uCenter;
+  uniform float uRadius;
+  uniform float uHalfH;
+  uniform float uFlicker;
+  uniform float uDensity;
+  uniform float uSpecimenGlow;
+  uniform float uSeed;
+  uniform vec3 uLiquid;
+  uniform vec3 uGlow;
+  uniform vec3 uFogColor;
+  uniform float uFogDensity;
+  uniform vec4 uSpine[6];
+  uniform vec4 uLimbA[4];
+  uniform vec4 uLimbB[4];
+  varying vec3 vWorld;
+
+  ${GLSL_NOISE}
+
+  float sdCone(vec3 p, vec3 a, vec3 b, float ra, float rb) {
+    vec3 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h) - mix(ra, rb, h);
+  }
+  float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+  }
+  float specimen(vec3 p) {
+    float d = 1e5;
+    for (int i = 0; i < 5; i++) {
+      d = smin(d, sdCone(p, uSpine[i].xyz, uSpine[i + 1].xyz, uSpine[i].w, uSpine[i + 1].w), 0.2);
+    }
+    for (int i = 0; i < 4; i++) {
+      d = smin(d, sdCone(p, uLimbA[i].xyz, uLimbB[i].xyz, uLimbA[i].w, uLimbB[i].w), 0.12);
+    }
+    return d;
+  }
+
+  void main() {
+    vec3 ro = cameraPosition - uCenter;
+    vec3 toFrag = vWorld - cameraPosition;
+    float tFar = length(toFrag);
+    vec3 rd = toFrag / tFar;
+
+    // Ray entry into the cylinder volume
+    float a = dot(rd.xz, rd.xz);
+    float b = dot(ro.xz, rd.xz);
+    float c = dot(ro.xz, ro.xz) - uRadius * uRadius;
+    float disc = b * b - a * c;
+    float tNear = 0.0;
+    if (disc > 0.0 && a > 1e-5) tNear = (-b - sqrt(disc)) / a;
+    if (abs(rd.y) > 1e-4) {
+      float t1 = (-uHalfH - ro.y) / rd.y;
+      float t2 = ( uHalfH - ro.y) / rd.y;
+      tNear = max(tNear, min(t1, t2));
+    }
+    tNear = max(tNear, 0.0);
+    if (tFar <= tNear + 1e-3) discard;
+
+    float dt = (tFar - tNear) / float(STEPS);
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float t = tNear + dt * jitter;
+
+    vec3 col = vec3(0.0);
+    float T = 1.0;
+    float light = uFlicker;
+    float selfGlow = mix(0.35, 1.0, uFlicker);
+
+    for (int i = 0; i < STEPS; i++) {
+      vec3 p = ro + rd * t;
+      float h = clamp((p.y + uHalfH) / (2.0 * uHalfH), 0.0, 1.0);
+      float r = length(p.xz) / uRadius;
+
+      // Suspended fluid: light falls off from the top plate, soft vertical shafts
+      float shaft = vnoise(vec3(p.x * 3.2 + uSeed, p.y * 0.4 - uTime * 0.07, p.z * 3.2));
+      float topGlow = 0.14 + 0.85 * h * h * h + 0.25 * smoothstep(0.95, 1.0, h);
+      vec3 fluidEm = uLiquid * topGlow * (0.4 + 1.1 * shaft * shaft) * light * (1.0 - 0.45 * r);
+      float sigma = 0.2 * uDensity;
+
+      // Specimen
+      float d = specimen(p);
+      d += (vnoise(p * 5.5 + vec3(uSeed, uTime * 0.12, 0.0)) - 0.5) * 0.09;
+      vec3 bodyEm = vec3(0.0);
+      if (d < 0.25) {
+        // Fine tissue detail: ridged noise gives bright filament networks
+        vec3 q = p * 7.0 + vec3(0.0, uTime * 0.04, uSeed);
+        float n1 = vnoise(q);
+        float n2 = vnoise(q * 2.3 + vec3(4.1, 1.7, 2.9));
+        float fil = pow(clamp(1.0 - abs(2.0 * n1 - 1.0), 0.0, 1.0), 7.0);
+        float fil2 = pow(clamp(1.0 - abs(2.0 * n2 - 1.0), 0.0, 1.0), 9.0);
+        float detail = fil * 0.9 + fil2 * 0.7;
+        float dd = d + (n2 - 0.5) * 0.05;
+        float body = smoothstep(0.02, -0.06, dd);
+        float rim = exp(-abs(dd) * 24.0);
+        bodyEm = uGlow * uSpecimenGlow * selfGlow * (0.6 + 0.7 * h) *
+                 (rim * 3.4 * (0.3 + 1.6 * detail) + body * (0.06 + 9.0 * detail));
+        sigma += body * 7.0 * uDensity;
+      }
+
+      vec3 em = fluidEm + bodyEm;
+      float att = exp(-sigma * dt);
+      col += T * em * dt;
+      T *= att;
+      t += dt;
+      if (T < 0.02) break;
+    }
+
+    float alpha = 1.0 - T;
+    float fogF = 1.0 - exp(-uFogDensity * uFogDensity * tNear * tNear);
+    col = mix(col, uFogColor * alpha, fogF);
+    gl_FragColor = vec4(max(col, 0.0), clamp(alpha, 0.0, 1.0));
+  }
+`;
+
+const liquidGeo = new CylinderGeometry(TANK_RADIUS, TANK_RADIUS, TANK_HALF_H * 2, 48, 1, false);
+const specimenState: SpecimenState[] = [];
+const liquidMaterials: ShaderMaterial[] = [];
+const tankGroup = new Group();
+scene.add(tankGroup);
+
+TANKS.forEach((t) => {
+  const def = CREATURES[t.creature];
+  const spine = def.spine.map(() => new Vector4());
+  const limbA = def.limbs.map(() => new Vector4());
+  const limbB = def.limbs.map(() => new Vector4());
+  const center = new Vector3(t.x, TANK_CENTER_Y, t.z);
+  const mat = new ShaderMaterial({
+    vertexShader: liquidVertex,
+    fragmentShader: liquidFragment,
+    defines: { STEPS: PARAMS.performance.raySteps },
+    uniforms: {
+      uTime: shared.uTime,
+      uFogColor: shared.uFogColor,
+      uFogDensity: shared.uFogDensity,
+      uLiquid: shared.uLiquid,
+      uGlow: shared.uGlow,
+      uCenter: { value: center },
+      uRadius: { value: TANK_RADIUS - 0.01 },
+      uHalfH: { value: TANK_HALF_H },
+      uFlicker: { value: 1 },
+      uDensity: { value: PARAMS.material.liquidDensity },
+      uSpecimenGlow: { value: PARAMS.material.specimenGlow },
+      uSeed: { value: t.seed * 10.0 },
+      uSpine: { value: spine },
+      uLimbA: { value: limbA },
+      uLimbB: { value: limbB }
+    },
+    side: BackSide,
+    transparent: true,
+    depthWrite: false,
+    blending: CustomBlending,
+    blendSrc: OneFactor,
+    blendDst: OneMinusSrcAlphaFactor
+  });
+  const mesh = new Mesh(liquidGeo, mat);
+  mesh.position.copy(center);
+  mesh.renderOrder = 3;
+  tankGroup.add(mesh);
+  liquidMaterials.push(mat);
+  specimenState.push({ def, spine, limbA, limbB, seed: t.seed });
+});
+
+function updateSpecimens(time: number): void {
+  const amp = PARAMS.animation.specimenMotion;
+  for (const s of specimenState) {
+    const bob = Math.sin(time * 0.23 + s.seed * 3.1) * 0.07 * amp;
+    const drift = Math.sin(time * 0.11 + s.seed) * 0.05 * amp;
+    const n = s.def.spine.length;
+    for (let i = 0; i < n; i++) {
+      const b = s.def.spine[i];
+      const k = (i / (n - 1)) * 0.8 + 0.2;
+      s.spine[i].set(
+        b[0] + Math.sin(time * 0.33 + s.seed + i * 0.65) * 0.09 * k * amp + drift,
+        b[1] + bob,
+        b[2] + Math.cos(time * 0.29 + s.seed * 1.7 + i * 0.5) * 0.07 * k * amp,
+        b[3] * (1.0 + Math.sin(time * 0.8 + s.seed + i) * 0.03 * amp)
+      );
+    }
+    for (let j = 0; j < s.def.limbs.length; j++) {
+      const la = s.def.limbs[j][0], lb = s.def.limbs[j][1];
+      s.limbA[j].set(la[0] + drift, la[1] + bob, la[2], la[3]);
+      s.limbB[j].set(
+        lb[0] + drift + Math.sin(time * 0.52 + s.seed + j * 1.9) * 0.16 * amp,
+        lb[1] + bob + Math.sin(time * 0.4 + j) * 0.05 * amp,
+        lb[2] + Math.cos(time * 0.47 + s.seed * 2.0 + j * 1.3) * 0.14 * amp,
+        lb[3]
+      );
+    }
+  }
+}
+
+// ============================================================================
+// Glass shells (fresnel + fake light streak reflections)
+// ============================================================================
+const glassMaterial = new ShaderMaterial({
+  uniforms: {
+    uTime: shared.uTime,
+    uReflect: { value: PARAMS.material.glassReflection },
+    uTint: { value: new Color(PARAMS.colors.tankLight) },
+    uFogColor: shared.uFogColor,
+    uFogDensity: shared.uFogDensity,
+    uLight: shared.uAvgLight
+  },
+  vertexShader: /* glsl */`
+    varying vec3 vN;
+    varying vec3 vWorld;
+    varying vec3 vLocal;
+    void main() {
+      vLocal = position;
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorld = wp.xyz;
+      vN = normalize(mat3(modelMatrix) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform float uTime;
+    uniform float uReflect;
+    uniform vec3 uTint;
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    uniform float uLight;
+    varying vec3 vN;
+    varying vec3 vWorld;
+    varying vec3 vLocal;
+    ${GLSL_NOISE}
+    void main() {
+      vec3 V = normalize(cameraPosition - vWorld);
+      vec3 N = normalize(vN);
+      float ndv = abs(dot(N, V));
+      float fres = pow(clamp(1.0 - ndv, 0.0, 1.0), 4.0);
+      vec3 R = reflect(-V, N);
+      // Streaks reflecting the tank's own top light and neighbouring lights
+      float streak = pow(max(0.0, 1.0 - abs(R.x * 1.4 + R.z * 0.3 - 0.35) * 5.0), 6.0)
+                   + 0.6 * pow(max(0.0, 1.0 - abs(R.x - R.z * 0.2 + 0.55) * 7.0), 8.0);
+      float hN = (vLocal.y + 2.3) / 4.6;
+      float topFade = 0.35 + 0.65 * smoothstep(0.0, 1.0, hN);
+      float smudge = 0.7 + 0.6 * vnoise(vec3(vLocal.x * 3.0, vLocal.y * 0.6, vLocal.z * 3.0));
+      vec3 col = uTint * (fres * 0.55 + streak * 0.35 * smudge) * topFade * uReflect;
+      col += uTint * 0.018 * uReflect;
+      float fogF = 1.0 - exp(-uFogDensity * uFogDensity * dot(vWorld - cameraPosition, vWorld - cameraPosition));
+      col *= (1.0 - fogF) * mix(0.6, 1.0, uLight);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: AdditiveBlending
+});
+const glassGeo = new CylinderGeometry(TANK_RADIUS + 0.04, TANK_RADIUS + 0.04, TANK_HALF_H * 2 + 0.1, 64, 1, true);
+TANKS.forEach((t) => {
+  const g = new Mesh(glassGeo, glassMaterial);
+  g.position.set(t.x, TANK_CENTER_Y, t.z);
+  g.renderOrder = 5;
+  tankGroup.add(g);
+});
+
+// ============================================================================
+// Bubbles (GPU animated points)
+// ============================================================================
+const bubbleUniforms = {
+  uTime: shared.uTime,
+  uSpeed: { value: PARAMS.animation.bubbleSpeed },
+  uSize: { value: PARAMS.geometry.bubbleSize },
+  uPointScale: shared.uPointScale,
+  uHalfH: { value: TANK_HALF_H },
+  uRadius: { value: TANK_RADIUS - 0.06 },
+  uCenters: { value: TANKS.map((t) => new Vector3(t.x, TANK_CENTER_Y, t.z)) },
+  uFlicker: { value: new Array<number>(TANK_COUNT).fill(1) },
+  uColor: { value: new Color(PARAMS.colors.glow) },
+  uFogColor: shared.uFogColor,
+  uFogDensity: shared.uFogDensity
+};
+const bubbleMaterial = new ShaderMaterial({
+  uniforms: bubbleUniforms,
+  vertexShader: /* glsl */`
+    uniform float uTime;
+    uniform float uSpeed;
+    uniform float uSize;
+    uniform float uPointScale;
+    uniform float uHalfH;
+    uniform float uRadius;
+    uniform vec3 uCenters[${TANK_COUNT}];
+    uniform float uFlicker[${TANK_COUNT}];
+    uniform float uFogDensity;
+    attribute vec4 aData;   // x, z, phase, speed
+    attribute vec4 aExtra;  // size, seed, tank index, wobble
+    varying float vAlpha;
+    varying float vPx;
+    varying float vBright;
+    void main() {
+      int idx = int(aExtra.z + 0.5);
+      float travel = 2.0 * uHalfH;
+      float life = fract(aData.z + uTime * aData.w * uSpeed / travel);
+      float y = -uHalfH + life * travel;
+      float seed = aExtra.y;
+      float wob = aExtra.w * (0.3 + life);
+      vec2 xz = aData.xy + vec2(sin(uTime * (1.6 + seed) + seed * 6.28), cos(uTime * (1.3 + seed * 0.7) + seed * 4.1)) * wob;
+      float rl = length(xz);
+      if (rl > uRadius) xz *= uRadius / rl;
+      vec3 world = uCenters[idx] + vec3(xz.x, y, xz.y);
+      vec4 mv = viewMatrix * vec4(world, 1.0);
+      gl_Position = projectionMatrix * mv;
+      float size = aExtra.x * uSize * (0.85 + 0.3 * life);
+      float px = size * uPointScale / -mv.z;
+      gl_PointSize = max(px, 1.5);
+      vPx = px;
+      float fogF = 1.0 - exp(-uFogDensity * uFogDensity * mv.z * mv.z);
+      vAlpha = smoothstep(0.0, 0.06, life) * smoothstep(1.0, 0.92, life) * (1.0 - fogF) * min(1.0, px / 1.5);
+      vBright = uFlicker[idx] * (0.35 + 1.1 * life * life);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor;
+    varying float vAlpha;
+    varying float vPx;
+    varying float vBright;
+    void main() {
+      vec2 uv = gl_PointCoord * 2.0 - 1.0;
+      float r = length(uv);
+      if (r > 1.0) discard;
+      float ring = smoothstep(0.55, 0.88, r) * smoothstep(1.0, 0.86, r);
+      float core = 0.1 * (1.0 - r);
+      float spec = smoothstep(0.32, 0.0, length(uv - vec2(-0.32, -0.34)));
+      float bubble = ring * 0.9 + core + spec * 1.3;
+      float dotShape = smoothstep(1.0, 0.0, r);
+      float a = mix(dotShape * 0.8, bubble, smoothstep(3.0, 7.0, vPx));
+      gl_FragColor = vec4(uColor * a * vAlpha * vBright * 1.6, 1.0);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: AdditiveBlending
+});
+
+let bubblePoints: Points | null = null;
+function buildBubbles(): void {
+  if (bubblePoints) {
+    tankGroup.remove(bubblePoints);
+    bubblePoints.geometry.dispose();
+  }
+  const perTank = PARAMS.geometry.bubblesPerTank;
+  const total = perTank * TANK_COUNT;
+  const data = new Float32Array(total * 4);
+  const extra = new Float32Array(total * 4);
+  const rng = mulberry32(2024);
+  let n = 0;
+  for (let ti = 0; ti < TANK_COUNT; ti++) {
+    // Several vertical streams per tank
+    const streams: [number, number][] = [];
+    for (let s = 0; s < 5; s++) {
+      const ang = rng() * Math.PI * 2, rad = 0.2 + rng() * 0.7;
+      streams.push([Math.cos(ang) * rad, Math.sin(ang) * rad]);
+    }
+    for (let k = 0; k < perTank; k++) {
+      const inStream = rng() < 0.55;
+      let x, z;
+      if (inStream) {
+        const s = streams[(rng() * streams.length) | 0];
+        x = s[0] + (rng() - 0.5) * 0.08; z = s[1] + (rng() - 0.5) * 0.08;
+      } else {
+        const ang = rng() * Math.PI * 2, rad = Math.sqrt(rng()) * (TANK_RADIUS - 0.1);
+        x = Math.cos(ang) * rad; z = Math.sin(ang) * rad;
+      }
+      const sizeR = Math.pow(rng(), 3.0);
+      const size = 0.012 + sizeR * 0.07;
+      const speed = 0.22 + sizeR * 0.6 + rng() * 0.15;
+      data.set([x, z, rng(), speed], n * 4);
+      extra.set([size, rng(), ti, inStream ? 0.03 + rng() * 0.03 : 0.02 + rng() * 0.06], n * 4);
+      n++;
+    }
+  }
+  const g = new BufferGeometry();
+  g.setAttribute('position', new BufferAttribute(new Float32Array(total * 3), 3));
+  g.setAttribute('aData', new BufferAttribute(data, 4));
+  g.setAttribute('aExtra', new BufferAttribute(extra, 4));
+  g.boundingSphere = new Sphere(new Vector3(0, 4, -10), 40);
+  bubblePoints = new Points(g, bubbleMaterial);
+  bubblePoints.frustumCulled = false;
+  bubblePoints.renderOrder = 4;
+  tankGroup.add(bubblePoints);
+}
+buildBubbles();
+
+// ============================================================================
+// Air dust and low floor mist
+// ============================================================================
+function buildDust(): void {
+  const count = 1800;
+  const rng = mulberry32(77);
+  const p = new Float32Array(count * 3), s = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    p[i * 3] = (rng() - 0.5) * 13;
+    p[i * 3 + 1] = rng() * 8.2;
+    p[i * 3 + 2] = CORRIDOR_BACK + rng() * (CORRIDOR_FRONT - 2 - CORRIDOR_BACK);
+    s[i] = rng();
+  }
+  const g = new BufferGeometry();
+  g.setAttribute('position', new BufferAttribute(p, 3));
+  g.setAttribute('aSeed', new BufferAttribute(s, 1));
+  const m = new ShaderMaterial({
+    uniforms: { uTime: shared.uTime, uPointScale: shared.uPointScale, uFogDensity: shared.uFogDensity, uLight: shared.uAvgLight, uColor: { value: new Color('#7fcfd6') } },
+    vertexShader: /* glsl */`
+      uniform float uTime;
+      uniform float uPointScale;
+      uniform float uFogDensity;
+      attribute float aSeed;
+      varying float vA;
+      void main() {
+        vec3 p = position;
+        p.x += sin(uTime * 0.13 + aSeed * 40.0) * 0.35;
+        p.y = mod(p.y + uTime * (0.03 + aSeed * 0.05), 8.2);
+        p.z += cos(uTime * 0.11 + aSeed * 23.0) * 0.35;
+        vec4 mv = viewMatrix * vec4(p, 1.0);
+        gl_Position = projectionMatrix * mv;
+        float px = (0.012 + aSeed * 0.018) * uPointScale / -mv.z;
+        gl_PointSize = max(px, 1.0);
+        float fogF = 1.0 - exp(-uFogDensity * uFogDensity * mv.z * mv.z);
+        vA = (1.0 - fogF) * smoothstep(1.5, 4.0, -mv.z) * min(1.0, px) * (0.4 + 0.6 * sin(uTime * 0.7 + aSeed * 60.0) * 0.5 + 0.3);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 uColor;
+      uniform float uLight;
+      varying float vA;
+      void main() {
+        float r = length(gl_PointCoord * 2.0 - 1.0);
+        if (r > 1.0) discard;
+        gl_FragColor = vec4(uColor * smoothstep(1.0, 0.0, r) * vA * 0.5 * uLight, 1.0);
+      }
+    `,
+    transparent: true, depthWrite: false, blending: AdditiveBlending
+  });
+  const pts = new Points(g, m);
+  pts.frustumCulled = false;
+  pts.renderOrder = 2;
+  scene.add(pts);
+}
+buildDust();
+
+const mistMaterial = new ShaderMaterial({
+  uniforms: {
+    uTime: shared.uTime,
+    uOpacity: { value: PARAMS.post.mist },
+    uColor: { value: new Color('#5aa7ad') },
+    uWarm: { value: new Color(PARAMS.colors.amber) },
+    uLight: shared.uAvgLight,
+    uFogColor: shared.uFogColor,
+    uFogDensity: shared.uFogDensity
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    varying vec3 vWorld;
+    void main() {
+      vUv = uv;
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorld = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform float uTime;
+    uniform float uOpacity;
+    uniform vec3 uColor;
+    uniform vec3 uWarm;
+    uniform float uLight;
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying vec3 vWorld;
+    ${GLSL_NOISE}
+    float fbm(vec3 p) {
+      float v = 0.0, a = 0.5;
+      for (int i = 0; i < 4; i++) { v += a * vnoise(p); p = p * 2.03 + vec3(1.7, 3.1, 0.4); a *= 0.5; }
+      return v;
+    }
+    void main() {
+      vec3 q = vec3(vWorld.x * 0.55 + uTime * 0.05, vWorld.y * 0.9 - uTime * 0.03, vWorld.z * 0.35 + uTime * 0.02);
+      float n = fbm(q + fbm(q * 0.7 + uTime * 0.02));
+      n = smoothstep(0.35, 0.85, n);
+      float edge = smoothstep(0.0, 0.25, vUv.x) * smoothstep(1.0, 0.75, vUv.x);
+      float vert = smoothstep(0.0, 0.12, vUv.y) * pow(clamp(1.0 - vUv.y, 0.0, 1.0), 1.6);
+      float dist = length(vWorld - cameraPosition);
+      float fogF = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
+      float nearFade = smoothstep(2.0, 6.0, dist);
+      float warmth = smoothstep(-16.0, -26.0, vWorld.z) * 0.6;
+      vec3 col = mix(uColor, uWarm, warmth) * n * edge * vert * uOpacity * 0.3 * (1.0 - fogF * 0.7) * nearFade * mix(0.5, 1.0, uLight);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+  transparent: true, depthWrite: false, blending: AdditiveBlending, side: DoubleSide
+});
+function buildMist(): void {
+  const spots: [number, number, number][] = [
+    [-3.4, -3.0, 4.5], [3.6, -3.4, 4.5], [-3.2, -10.2, 5], [3.2, -10.0, 5],
+    [-3.0, -17.2, 5], [3.0, -17.0, 5], [-1.6, -21.8, 4], [1.8, -21.6, 4], [0, -25.2, 8], [0, -14, 6]
+  ];
+  const g = new PlaneGeometry(1, 1);
+  spots.forEach(([x, z, w]) => {
+    const m = new Mesh(g, mistMaterial);
+    m.scale.set(w, 2.6, 1);
+    m.position.set(x, 1.3, z);
+    m.renderOrder = 1;
+    scene.add(m);
+  });
+}
+buildMist();
+
+// ============================================================================
+// Lights
+// ============================================================================
+const hemi = new HemisphereLight(0x10363a, 0x020505, PARAMS.lighting.ambient);
+scene.add(hemi);
+
+const tankLightColor = new Color(PARAMS.colors.tankLight);
+const tankLights = TANKS.map((t) => {
+  const l = new PointLight(tankLightColor, PARAMS.lighting.tankLight, 12, 1.6);
+  l.position.set(t.x * 0.92, TANK_CENTER_Y + 0.8, t.z + (t.x === 0 ? 0.9 : 0));
+  scene.add(l);
+  return l;
+});
+const amberLights: PointLight[] = [
+  [-6.4, 0.5, 3.8], [6.4, 0.5, 3.8], [-1.9, 0.45, -21.5], [1.9, 0.45, -21.5]
+].map(([x, y, z]) => {
+  const l = new PointLight(amberColor, PARAMS.lighting.amberLight, 7, 1.8);
+  l.position.set(x, y, z);
+  scene.add(l);
+  return l;
+});
+
+// ============================================================================
+// Flicker controller
+// ============================================================================
+class FlickerChannel {
+  rng: () => number;
+  rateMul: number;
+  value = 1;
+  eventStart = -1;
+  eventEnd = -1;
+  mode = 0;
+  freq = 20;
+  next: number;
+
+  constructor(seed: number, rateMul: number) {
+    this.rng = mulberry32((seed * 1000) | 0);
+    this.rateMul = rateMul;
+    this.next = 1.5 + this.rng() * 6;
+  }
+  trigger(time: number, duration: number, mode: number): void {
+    this.eventStart = time;
+    this.eventEnd = time + duration;
+    this.mode = mode;
+    this.freq = 14 + this.rng() * 22;
+  }
+  target(time: number): number {
+    const depth = PARAMS.lighting.flickerDepth;
+    if (!PARAMS.lighting.flicker) return 1;
+    if (time >= this.next && time > this.eventEnd) {
+      const r = this.rng();
+      this.trigger(time, 0.12 + this.rng() * (r < 0.7 ? 0.6 : 1.4), r < 0.7 ? 0 : 1);
+      this.next = this.eventEnd + (3 + this.rng() * 11) / (PARAMS.lighting.flickerRate * this.rateMul);
+    }
+    const hum = 0.985 + 0.015 * Math.sin(time * 9.7 + this.freq);
+    if (time < this.eventEnd) {
+      const k = (time - this.eventStart) / (this.eventEnd - this.eventStart);
+      if (this.mode === 0) {
+        // Stutter: hard on/off pattern
+        const step = Math.floor((time - this.eventStart) * this.freq);
+        const h = Math.sin(step * 12.9898 + this.freq * 78.233) * 43758.5453;
+        const on = (h - Math.floor(h)) > 0.45;
+        return on ? hum : 1 - depth * (0.75 + 0.25 * (h - Math.floor(h)));
+      }
+      // Brownout: sag and recover with jitter
+      const sag = Math.sin(Math.PI * k);
+      const jit = Math.sin(time * 61.0) * Math.sin(time * 37.0) * 0.15;
+      return Math.max(0.02, 1 - depth * (0.7 * sag + jit * sag));
+    }
+    return hum;
+  }
+  update(time: number, dt: number): number {
+    const tgt = this.target(time);
+    const k = 1 - Math.exp(-dt * (tgt < this.value ? 60 : 28));
+    this.value += (tgt - this.value) * k;
+    return this.value;
+  }
+}
+const flickers = TANKS.map((t) => new FlickerChannel(t.seed + 0.37, t.faulty));
+const amberFlicker = new FlickerChannel(9.1, 0.4);
+let nextSurge = 18 + Math.random() * 20;
+
+function powerSurge(time: number): void {
+  flickers.forEach((f, i) => f.trigger(time + i * 0.05, 0.7 + Math.random() * 0.6, 0));
+  amberFlicker.trigger(time, 0.6, 0);
+}
+
+// ============================================================================
+// Post-processing
+// ============================================================================
+const GradeShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uVignette: { value: PARAMS.post.vignette },
+    uChromatic: { value: PARAMS.post.chromatic },
+    uGrain: { value: PARAMS.post.grain },
+    uResolution: { value: new Vector2(1, 1) }
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform float uVignette;
+    uniform float uChromatic;
+    uniform float uGrain;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+    float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+    void main() {
+      vec2 c = vUv - 0.5;
+      float d2 = dot(c, c);
+      vec2 off = c * uChromatic * (1.0 + d2 * 6.0);
+      vec3 col;
+      col.r = texture2D(tDiffuse, vUv - off).r;
+      col.g = texture2D(tDiffuse, vUv).g;
+      col.b = texture2D(tDiffuse, vUv + off).b;
+      // Teal shadows, keep highlights clean
+      float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      col = mix(col * vec3(0.86, 1.03, 1.06), col, smoothstep(0.0, 0.6, l));
+      col += vec3(0.0015, 0.006, 0.007);
+      // Vignette
+      vec2 vc = c * vec2(1.0, 1.25);
+      float vig = smoothstep(0.85, 0.15, length(vc));
+      col *= mix(1.0, vig, uVignette);
+      // Film grain
+      float n = hash12(vUv * uResolution + fract(uTime * 7.13) * 400.0) - 0.5;
+      col *= 1.0 + n * uGrain * 2.0;
+      col = max(col, 0.0);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `
+};
+
+// Removes NaN / Inf pixels and clamps extreme HDR values before bloom
+const SanitizeShader = {
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      if (any(isnan(c)) || any(isinf(c))) c = vec4(0.0, 0.0, 0.0, 1.0);
+      gl_FragColor = vec4(clamp(c.rgb, 0.0, 64.0), 1.0);
+    }
+  `
+};
+
+const MAX_SAMPLES = renderer.capabilities.maxSamples || 4;
+const composerTarget = new WebGLRenderTarget(1, 1, { type: HalfFloatType, samples: Math.min(PARAMS.performance.msaa, MAX_SAMPLES) });
+const composer = new EffectComposer(renderer, composerTarget);
+const renderPass = new RenderPass(scene, camera);
+const bloomPass = new UnrealBloomPass(new Vector2(window.innerWidth, window.innerHeight), PARAMS.post.bloomStrength, PARAMS.post.bloomRadius, PARAMS.post.bloomThreshold);
+const sanitizePass = new ShaderPass(SanitizeShader);
+const gradePass = new ShaderPass(GradeShader);
+const outputPass = new OutputPass();
+composer.addPass(renderPass);
+composer.addPass(sanitizePass);
+composer.addPass(bloomPass);
+composer.addPass(gradePass);
+composer.addPass(outputPass);
+// SMAA runs on the tone-mapped image and cleans edges MSAA cannot reach (shader edges, bright rims)
+const smaaPass = new SMAAPass(window.innerWidth, window.innerHeight);
+smaaPass.enabled = PARAMS.performance.smaa;
+composer.addPass(smaaPass);
+
+// ============================================================================
+// Resize / DPR
+// ============================================================================
+function applySize(): void {
+  const w = window.innerWidth, h = window.innerHeight;
+  const dpr = Math.min(PARAMS.performance.dpr, MAX_DPR);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, h);
+  composer.setPixelRatio(dpr);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  const bufferH = h * dpr;
+  shared.uPointScale.value = bufferH / (2 * Math.tan(MathUtils.degToRad(camera.fov) / 2));
+  gradePass.uniforms.uResolution.value.set(w * dpr, h * dpr);
+}
+applySize();
+window.addEventListener('resize', applySize);
+
+// ============================================================================
+// GUI
+// ============================================================================
+const gui = new GUI({ title: 'Xeno Bio Lab' });
+
+const fCam = gui.addFolder('Camera');
+fCam.add(PARAMS.camera, 'fov', 30, 80, 1).name('FOV').onChange(() => { updateCamera(); applySize(); });
+fCam.add(PARAMS.camera, 'height', 1.2, 5, 0.05).name('Height').onChange(updateCamera);
+fCam.add(PARAMS.camera, 'lookHeight', 1, 6, 0.05).name('Look Height').onChange(updateCamera);
+fCam.add(PARAMS.camera, 'autoMove').name('Auto Fly-Through');
+fCam.add(PARAMS.camera, 'moveSpeed', 0.1, 3, 0.05).name('Move Speed');
+fCam.add(PARAMS.camera, 'turnDuration', 2, 15, 0.5).name('Turn Duration');
+fCam.add({ restart: () => { Object.assign(cameraRig, { phase: 0, progress: 0, yaw: 0, z: CAMERA_NEAR_Z, x: 0 }); updateCamera(); } }, 'restart').name('Restart Path');
+
+const fAnim = gui.addFolder('Animation');
+fAnim.add(PARAMS.animation, 'timeScale', 0, 3, 0.01).name('Time Scale');
+fAnim.add(PARAMS.animation, 'bubbleSpeed', 0, 3, 0.01).name('Bubble Speed').onChange((v: number) => { bubbleUniforms.uSpeed.value = v; });
+fAnim.add(PARAMS.animation, 'specimenMotion', 0, 3, 0.01).name('Specimen Motion');
+
+const fGeo = gui.addFolder('Geometry');
+fGeo.add(PARAMS.geometry, 'bubblesPerTank', 50, 1500, 10).name('Bubbles Per Tank').onFinishChange(buildBubbles);
+fGeo.add(PARAMS.geometry, 'bubbleSize', 0.3, 3, 0.05).name('Bubble Size').onChange((v: number) => { bubbleUniforms.uSize.value = v; });
+
+const fMat = gui.addFolder('Material');
+fMat.add(PARAMS.material, 'liquidDensity', 0.1, 3, 0.01).name('Liquid Density').onChange((v: number) => liquidMaterials.forEach((m) => { m.uniforms.uDensity.value = v; }));
+fMat.add(PARAMS.material, 'specimenGlow', 0, 3, 0.01).name('Specimen Glow').onChange((v: number) => liquidMaterials.forEach((m) => { m.uniforms.uSpecimenGlow.value = v; }));
+fMat.add(PARAMS.material, 'glassReflection', 0, 3, 0.01).name('Glass Reflection').onChange((v: number) => { glassMaterial.uniforms.uReflect.value = v; });
+fMat.add(PARAMS.material, 'metalRoughness', 0.1, 1, 0.01).name('Metal Roughness').onChange(applyMetal);
+fMat.add(PARAMS.material, 'envIntensity', 0, 2, 0.01).name('Reflections').onChange((v: number) => { scene.environmentIntensity = v; });
+
+const fCol = gui.addFolder('Colors');
+fCol.addColor(PARAMS.colors, 'liquid').name('Liquid').onChange((v: string) => shared.uLiquid.value.set(v));
+fCol.addColor(PARAMS.colors, 'glow').name('Specimen Glow').onChange((v: string) => { shared.uGlow.value.set(v); bubbleUniforms.uColor.value.set(v); });
+fCol.addColor(PARAMS.colors, 'tankLight').name('Tank Light').onChange((v: string) => { tankLightColor.set(v); tankLights.forEach((l) => l.color.copy(tankLightColor)); glassMaterial.uniforms.uTint.value.set(v); });
+fCol.addColor(PARAMS.colors, 'amber').name('Amber').onChange((v: string) => { amberColor.set(v); amberLights.forEach((l) => l.color.copy(amberColor)); mistMaterial.uniforms.uWarm.value.set(v); });
+fCol.addColor(PARAMS.colors, 'fog').name('Fog').onChange((v: string) => { fogColor.set(v); fog.color.copy(fogColor); background.copy(fogColor); shared.uFogColor.value.copy(fogColor); });
+fCol.addColor(PARAMS.colors, 'metal').name('Metal').onChange(applyMetal);
+
+const fLight = gui.addFolder('Lighting');
+fLight.add(PARAMS.lighting, 'tankLight', 0, 60, 0.5).name('Tank Light');
+fLight.add(PARAMS.lighting, 'amberLight', 0, 20, 0.1).name('Amber Light');
+fLight.add(PARAMS.lighting, 'ambient', 0, 3, 0.01).name('Ambient').onChange((v: number) => { hemi.intensity = v; });
+fLight.add(PARAMS.lighting, 'exposure', 0.3, 2.5, 0.01).name('Exposure').onChange((v: number) => { renderer.toneMappingExposure = v; });
+fLight.add(PARAMS.lighting, 'flicker').name('Flicker');
+fLight.add(PARAMS.lighting, 'flickerRate', 0.1, 5, 0.05).name('Flicker Rate');
+fLight.add(PARAMS.lighting, 'flickerDepth', 0, 1, 0.01).name('Flicker Depth');
+fLight.add({ surge: () => powerSurge(elapsed) }, 'surge').name('Trigger Power Surge');
+
+const fPost = gui.addFolder('Post Processing');
+fPost.add(PARAMS.post, 'bloomStrength', 0, 3, 0.01).name('Bloom Strength').onChange((v: number) => { bloomPass.strength = v; });
+fPost.add(PARAMS.post, 'bloomRadius', 0, 1.5, 0.01).name('Bloom Radius').onChange((v: number) => { bloomPass.radius = v; });
+fPost.add(PARAMS.post, 'bloomThreshold', 0, 3, 0.01).name('Bloom Threshold').onChange((v: number) => { bloomPass.threshold = v; });
+fPost.add(PARAMS.post, 'vignette', 0, 1.5, 0.01).name('Vignette').onChange((v: number) => { gradePass.uniforms.uVignette.value = v; });
+fPost.add(PARAMS.post, 'chromatic', 0, 0.01, 0.0001).name('Chromatic Aberration').onChange((v: number) => { gradePass.uniforms.uChromatic.value = v; });
+fPost.add(PARAMS.post, 'grain', 0, 0.2, 0.001).name('Film Grain').onChange((v: number) => { gradePass.uniforms.uGrain.value = v; });
+fPost.add(PARAMS.post, 'fogDensity', 0, 0.08, 0.001).name('Fog Density').onChange((v: number) => { fog.density = v; shared.uFogDensity.value = v; });
+fPost.add(PARAMS.post, 'mist', 0, 3, 0.01).name('Floor Mist').onChange((v: number) => { mistMaterial.uniforms.uOpacity.value = v; });
+
+const fPerf = gui.addFolder('Performance');
+fPerf.add(PARAMS.performance, 'dpr', 0.5, MAX_DPR, 0.05).name('DPR').onChange(applySize);
+fPerf.add(PARAMS.performance, 'raySteps', 16, 96, 4).name('Raymarch Steps').onFinishChange((v: number) => {
+  liquidMaterials.forEach((m) => { m.defines.STEPS = v; m.needsUpdate = true; });
+});
+fPerf.add(PARAMS.performance, 'msaa', [0, 2, 4, 8]).name('MSAA Samples').onChange((v: number) => {
+  const samples = Math.min(Number(v), MAX_SAMPLES);
+  for (const rt of [composer.renderTarget1, composer.renderTarget2]) { rt.samples = samples; rt.dispose(); }
+});
+fPerf.add(PARAMS.performance, 'smaa').name('SMAA').onChange((v: boolean) => { smaaPass.enabled = v; });
+fPerf.add(PARAMS.performance, 'paused').name('Pause');
+gui.close();
+
+function applyMetal(): void {
+  metalColor.set(PARAMS.colors.metal);
+  const r = PARAMS.material.metalRoughness;
+  for (const [m, tone, rough] of metalMaterials) {
+    m.color.copy(metalColor).multiplyScalar(tone);
+    if (rough !== null) m.roughness = r * rough;
+  }
+  backWallExtraMaterials.forEach((m) => m.color.copy(metalColor).multiplyScalar(0.5));
+}
+
+// ============================================================================
+// Animation loop
+// ============================================================================
+const clock = new Clock();
+let elapsed = 0;
+
+document.addEventListener('visibilitychange', () => { clock.getDelta(); });
+
+function updateLights(dt: number): void {
+  let sum = 0;
+  if (PARAMS.lighting.flicker && elapsed > nextSurge) {
+    powerSurge(elapsed);
+    nextSurge = elapsed + 25 + Math.random() * 35 / PARAMS.lighting.flickerRate;
+  }
+  for (let i = 0; i < TANK_COUNT; i++) {
+    const v = flickers[i].update(elapsed, dt);
+    sum += v;
+    tankLights[i].intensity = PARAMS.lighting.tankLight * v;
+    liquidMaterials[i].uniforms.uFlicker.value = v;
+    bubbleUniforms.uFlicker.value[i] = v;
+    tmpColor.copy(tankLightColor).multiplyScalar(2.4 * v);
+    tankCyan.setColorAt(i, tmpColor);
+  }
+  if (tankCyan.instanceColor) tankCyan.instanceColor.needsUpdate = true;
+  shared.uAvgLight.value = sum / TANK_COUNT;
+  const a = amberFlicker.update(elapsed, dt);
+  amberLights.forEach((l) => { l.intensity = PARAMS.lighting.amberLight * a; });
+  amberEmissive.color.copy(amberColor).multiplyScalar(2.6 * (0.25 + 0.75 * a));
+}
+
+renderer.setAnimationLoop(() => {
+  const rawDt = Math.min(clock.getDelta(), 0.1);
+  if (PARAMS.performance.paused) { composer.render(); return; }
+  const dt = rawDt * PARAMS.animation.timeScale;
+  elapsed += dt;
+  shared.uTime.value = elapsed;
+  gradePass.uniforms.uTime.value = elapsed;
+  if (PARAMS.camera.autoMove) advanceCameraRig(dt);
+  updateCamera();
+  updateSpecimens(elapsed);
+  updateLights(Math.max(dt, 1e-4));
+  composer.render();
+});
+</script>
